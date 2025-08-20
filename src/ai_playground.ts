@@ -1,4 +1,5 @@
 import { ChatAnthropic } from "@langchain/anthropic";
+import { ChatOpenAI } from "@langchain/openai";
 import { z } from "zod";
 import { FaqItem,FaqSection,FaqSource } from "./generated/prisma";
 import { createReactAgent } from "@langchain/langgraph/prebuilt";
@@ -6,117 +7,137 @@ import { tool } from "@langchain/core/tools";
 import { BaseMessage } from "@langchain/core/messages";
 import fs from "fs";
 import dotenv from "dotenv";
+import type { ToolInterface } from "@langchain/core/tools";
+
 dotenv.config();
 
 
-const claude = new ChatAnthropic({
-  model: "claude-opus-4-20250514",
-  temperature: 0
-});
-
+const gpt = new ChatOpenAI({
+    model: "gpt-5-nano-2025-08-07"
+})
 
 const systemPrompt = `
 You will be responsible for creating FAQs from the provided data. You will need to thoroughly understand the data and create FAQs based on that understanding.
+If it is already structured to a certain extent, try to understand the author's intent and reflect it in the FAQ's Q&A and section divisions.
+
+YOU MUST ALWAYS USE THE TOOLS PROVIDED TO YOU.
+** upsertSection **: Upsert section and qa list
+** getQABySection **: Get qa list by section name
+** getSectionNameList **: Get section name list
 `
 
-// Schema
-// step1 get data description and sections
-const dataAbstractionSchema = z.object({
-    name: z.string().describe("Name of the data"),
-    description: z.string().describe("Detailed explanation of the data provided."),
-    strategy: z.string().describe("Plan for what kind of FAQ to create based on the data provided"),
-    fileType: z.string().describe("File type of the data like csv, json, text, etc."),
-});
-
-const sectionSchema = z.object({sections: z.array(
-    z.object({
+const sectionSchema = z.object({
     name: z.string().describe("Name of the section"),
-    description: z.string().describe("Description of the section"),
-})).describe("Section for categorizing FAQs")});
+    qaList: z.array(z.object({
+        question: z.string().describe("Question of the FAQ"),
+        answers: z.array(z.string()).describe("Answers of the FAQ"),
+    })).describe("Q&A list of the section"),
+}).describe("Section-based QA.");
 
-// step2 get all faq items
-const faqItemsSchema = z.array(z.object({
-    sectionName: z.string().describe("Name of the section that the FAQ belongs to"),
-    question: z.string().describe("Question of the FAQ"),
-    answers: z.array(z.string()).describe("Answers of the FAQ"),
-})).describe("List of FAQ items");
+//local db
+const qas = new Map<string, {question: string, answers: string[]}>()
 
 // Tools
-const upsertDataAbstraction = tool(
-    async({name, description, strategy, fileType}) => {
-        console.log("upsertDataAbstraction", name, description, strategy, fileType)
-    },
-    {
-        name: "upsertDataAbstraction",
-        description: "Upsert data abstraction",
-        schema: dataAbstractionSchema,
-    }
-)
-
 const upsertSection = tool(
-    async({sections}) => {
-        console.log("upsertSection", JSON.stringify(sections, null, 2))
+    async({name, qaList}) => {
+        console.log("⚙️upsertSection", name, qaList)
+        qas.set(name, qaList)
     },
     {
         name: "upsertSection",
         description: "Upsert section",
-        schema: sectionSchema,
+        schema: sectionSchema as z.ZodTypeAny,
     }
 )
 
-const upsertFaqItems = tool(
-    async({faqItems}) => {
-        console.log("upsertFaqItems", JSON.stringify(faqItems, null, 2))
+const getQABySection = tool(
+    async({sectionName}:{sectionName: string}) => {
+        console.log("⚙️getQABySection", sectionName)
+        return qas.get(sectionName)
     },
     {
-        name: "upsertFaqItems",
-        description: "Upsert FAQ items",
-        schema: z.object({faqItems: faqItemsSchema}),
+        name: "getQABySection",
+        description: "Get QA by section name",
     }
 )
 
-const tools = [upsertDataAbstraction, upsertSection, upsertFaqItems]
+const getSectionNameList = tool(
+    async() => {
+        console.log("⚙️getSectionList")
+        return Array.from(qas.keys())
+    },
+    {
+        name: "getSectionList",
+        description: "Get section list",
+    }
+)
+// fuck you zod
+const tools: ToolInterface[] = [upsertSection, getQABySection, getSectionNameList]
 
 // Agent
 const agent = createReactAgent({
-    llm: claude,
+    llm: gpt,
     tools
 })
 
 async function exec(messages:any[]) {
+    console.log("[exec] --start--")
     if (messages.length > 0 && messages[0].role !== "system"){
         messages.unshift({
             role: "system",
             content: systemPrompt
         })
     }
-    const stream = await agent.stream({
+    const res = await agent.stream({
         messages: messages
+    },{
+        streamMode: "messages"
     })
     let result = ""
-    for await (const chunk of stream) {
-        console.log(chunk.content)
-        result += chunk.content
+    for await (const chunk of res){
+        console.log(chunk[0].content)
+        result += chunk[0].content
     }
-    return result
+    console.log(result);
+    return [result]
 }
 
 async function main() {
     console.log("start")
     const dataCsv = fs.readFileSync("./data/data.csv", "utf-8");
-    console.log(dataCsv.slice(0, 1000))
 
-    const messages = [
+    let messages = [
         {
             role: "user",
             content: `Please create a FAQ for the data provided.\n<data>\n${dataCsv}\n</data>`
         }
     ]
 
-    console.log("chat messages", messages)
+    let result = await exec(messages)
+    messages = [...messages,...result] as any[]
+    while(true) {
+        const readline = require('readline');
+        const rl = readline.createInterface({
+            input: process.stdin,
+            output: process.stdout
+        });
+        
+        const cliPrompt = await new Promise<string>((resolve) => {
+            rl.question('Enter your message: ', (answer: string) => {
+                resolve(answer);
+            });
+        });
+        
+        const human = cliPrompt
+        messages = [...messages, { role: "user", content: human }]
+        result = await exec(messages)
+        console.log(JSON.stringify(qas, null, 2))
+        messages = [...messages,...result] as any[]
+        
+        rl.close();
+    }
+    
 
-    const result = await exec(messages)
-    console.log(result)
 }
 
 console.log("start")
